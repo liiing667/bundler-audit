@@ -252,4 +252,94 @@ describe Scanner do
       end
     end
   end
+
+  describe "fail-closed database ingest" do
+    let(:bundle)    { 'unpatched_gems' }
+    let(:directory) { File.join('spec','bundle',bundle) }
+
+    let(:database_root) { File.join(Fixtures::TMP_DIR,'fail-closed-db') }
+    let(:gem_root)      { File.join(database_root,'gems','activesupport') }
+
+    let(:valid_advisory) do
+      <<~YAML
+        ---
+        gem: activesupport
+        cve: 2013-0156
+        url: https://example.com/advisory
+        title: Example advisory
+        date: 2013-01-01
+        description: An example advisory.
+        patched_versions:
+          - ">= 3.2.11"
+      YAML
+    end
+
+    before do
+      FileUtils.mkdir_p(gem_root)
+      File.write(File.join(gem_root,'CVE-2013-0156.yml'),valid_advisory)
+    end
+
+    after { FileUtils.rm_rf(database_root) }
+
+    let(:database) { Database.new(database_root) }
+    let(:scanner)  { described_class.new(directory,'Gemfile.lock',database) }
+
+    context "when an advisory is a symlink outside of the database root" do
+      let(:outside_file) { File.join(Fixtures::TMP_DIR,'escaped-advisory.yml') }
+
+      before do
+        File.write(outside_file,valid_advisory)
+        FileUtils.ln_s(outside_file,File.join(gem_root,'LINK-1.yml'))
+      end
+
+      after { FileUtils.rm_f(outside_file) }
+
+      it "must raise instead of returning a clean scan" do
+        expect {
+          scanner.scan.to_a
+        }.to raise_error(Database::InvalidDatabaseError)
+      end
+
+      it "must raise when building a report" do
+        expect {
+          scanner.report.to_a
+        }.to raise_error(Database::InvalidDatabaseError)
+      end
+    end
+
+    context "when an advisory has an invalid version requirement" do
+      before do
+        File.write(File.join(gem_root,'BAD-1.yml'),
+                   "gem: activesupport\npatched_versions:\n  - \"garbage\"\n")
+      end
+
+      it "must raise instead of silently ignoring the advisory" do
+        expect {
+          scanner.scan.to_a
+        }.to raise_error(Database::InvalidAdvisoryError)
+      end
+    end
+
+    context "when an advisory declares an empty interval" do
+      before do
+        File.write(File.join(gem_root,'EMPTY-1.yml'),
+                   "gem: activesupport\npatched_versions:\n  - \">= 2.0, < 1.0\"\n")
+      end
+
+      it "must raise instead of treating every version as unaffected" do
+        expect {
+          scanner.scan.to_a
+        }.to raise_error(Database::InvalidAdvisoryError)
+      end
+    end
+
+    context "when the database is valid" do
+      it "must still report vulnerable gems" do
+        results = scanner.scan.to_a
+
+        expect(results).not_to be_empty
+        expect(results.map { |result| result.advisory.id }).to include('CVE-2013-0156')
+      end
+    end
+  end
 end

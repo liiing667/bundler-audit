@@ -324,6 +324,222 @@ describe Bundler::Audit::Database do
     end
   end
 
+  describe "ingestion boundary" do
+    let(:database_root) { Fixtures.join('ingestion-boundary-db') }
+    let(:gems_root)     { File.join(database_root,'gems') }
+    let(:gem_root)      { File.join(gems_root,'example_gem') }
+
+    let(:valid_advisory) do
+      <<~YAML
+        ---
+        gem: example_gem
+        cve: 2020-0001
+        url: https://example.com/advisory
+        title: Example advisory
+        date: 2020-01-01
+        description: An example advisory.
+        patched_versions:
+          - ">= 2.0.0"
+      YAML
+    end
+
+    before do
+      FileUtils.mkdir_p(gem_root)
+      File.write(File.join(gem_root,'CVE-2020-0001.yml'),valid_advisory)
+    end
+
+    after { FileUtils.rm_rf(database_root) }
+
+    subject { described_class.new(database_root) }
+
+    def advisory_paths
+      subject.advisories.map(&:path)
+    end
+
+    describe "#initialize" do
+      it "must resolve a symlinked database root to its real path" do
+        link_path = Fixtures.join('ingestion-boundary-link')
+
+        FileUtils.ln_s(database_root,link_path)
+
+        begin
+          expect(described_class.new(link_path).path).to eq(File.realpath(database_root))
+        ensure
+          FileUtils.rm_f(link_path)
+        end
+      end
+    end
+
+    context "when an advisory file is a symlink" do
+      let(:outside_file) { Fixtures.join('outside-advisory.yml') }
+
+      before do
+        File.write(outside_file,valid_advisory)
+        FileUtils.ln_s(outside_file,File.join(gem_root,'LINK-1.yml'))
+      end
+
+      after { FileUtils.rm_f(outside_file) }
+
+      it "must reject the symlink instead of following it" do
+        expect {
+          advisory_paths
+        }.to raise_error(described_class::InvalidDatabaseError, /symlink/)
+      end
+    end
+
+    context "when a parent directory symlink escapes the database root" do
+      let(:outside_root) { Fixtures.join('outside-gem-directory') }
+
+      before do
+        FileUtils.mkdir_p(outside_root)
+        File.write(File.join(outside_root,'ESCAPE-1.yml'),valid_advisory)
+        FileUtils.ln_s(outside_root,File.join(gems_root,'escaping_gem'))
+      end
+
+      after { FileUtils.rm_rf(outside_root) }
+
+      it "must reject the entry because its real path escapes the root" do
+        expect {
+          advisory_paths
+        }.to raise_error(described_class::InvalidDatabaseError)
+      end
+    end
+
+    context "when a gem entry is a symlinked directory" do
+      before do
+        other_root = File.join(gems_root,'real_gem')
+        FileUtils.mkdir_p(other_root)
+        FileUtils.ln_s(other_root,File.join(gems_root,'evil_gem'))
+      end
+
+      it "must reject the symlinked directory" do
+        expect {
+          advisory_paths
+        }.to raise_error(described_class::InvalidDatabaseError, /symlink/)
+      end
+    end
+
+    context "when an advisory file is not a regular file" do
+      before do
+        File.mkfifo(File.join(gem_root,'FIFO-1.yml'))
+      end
+
+      it "must reject non-regular files" do
+        expect {
+          advisory_paths
+        }.to raise_error(described_class::InvalidDatabaseError, /regular/)
+      end
+    end
+
+    context "when an advisory file exceeds the size limit" do
+      before do
+        stub_const("#{described_class}::MAX_ADVISORY_SIZE",64)
+      end
+
+      it "must reject the oversized file" do
+        expect {
+          advisory_paths
+        }.to raise_error(described_class::InvalidDatabaseError, /exceeds the limit/)
+      end
+    end
+
+    context "when an advisory violates the schema" do
+      before do
+        File.write(File.join(gem_root,'BAD-1.yml'),"gem: example_gem\npatched_versions:\n  - \"garbage\"\n")
+      end
+
+      it "must fail closed with an InvalidAdvisoryError" do
+        expect {
+          advisory_paths
+        }.to raise_error(described_class::InvalidAdvisoryError)
+      end
+
+      it "must not silently treat the database as empty" do
+        expect {
+          subject.check_gem(Gem::Specification.new { |s| s.name='example_gem'; s.version='1.0.0' }).to_a
+        }.to raise_error(described_class::InvalidAdvisoryError)
+      end
+    end
+
+    context "when a lookup uses an unsafe gem name" do
+      it "must never read outside of the gems directory" do
+        expect(subject.advisories_for('../../etc').to_a).to be_empty
+        expect(subject.advisories_for('.').to_a).to be_empty
+      end
+    end
+
+    context "when a primary identifier is re-declared with different ranges" do
+      let(:second_advisory) do
+        valid_advisory.sub('title: Example advisory',
+                           'title: Duplicate primary identifier')
+                     .sub('>= 2.0.0','>= 3.0.0')
+      end
+
+      before do
+        # The second file declares the same primary CVE identifier as the
+        # first, but claims a different patched range.
+        File.write(File.join(gem_root,'CVE-2020-0001-copy.yml'),second_advisory)
+      end
+
+      it "must reject the conflicting aliases" do
+        expect {
+          subject.advisories_for('example_gem').to_a
+        }.to raise_error(described_class::InvalidDatabaseError, /conflicting advisories/)
+      end
+    end
+
+    context "when two distinct advisories merely share a secondary alias" do
+      let(:second_advisory) do
+        valid_advisory.sub('cve: 2020-0001','cve: 2020-0002')
+                        .sub('>= 2.0.0','>= 3.0.0')
+      end
+
+      before do
+        File.write(File.join(gem_root,'CVE-2020-0002.yml'),second_advisory)
+      end
+
+      it "must accept the distinct advisories even if their ranges differ" do
+        expect {
+          subject.advisories_for('example_gem').to_a
+        }.not_to raise_error
+      end
+    end
+
+    context "when two advisories share a secondary alias with identical ranges" do
+      let(:second_advisory) do
+        valid_advisory.sub('cve: 2020-0001',"cve: 2020-0002\nghsa: aaaa-bbbb-cccc")
+      end
+
+      before do
+        first = File.join(gem_root,'CVE-2020-0001.yml')
+        File.write(first,valid_advisory + "ghsa: aaaa-bbbb-cccc\n")
+        File.write(File.join(gem_root,'CVE-2020-0002.yml'),second_advisory)
+      end
+
+      it "must accept the compatible duplicate alias" do
+        expect {
+          subject.advisories_for('example_gem').to_a
+        }.not_to raise_error
+      end
+    end
+
+    context "when the database is valid" do
+      it "must ingest the regular advisory file" do
+        paths = advisory_paths
+
+        expect(paths).to contain_exactly(File.join(gem_root,'CVE-2020-0001.yml'))
+      end
+
+      it "must return no advisories for gems without a directory" do
+        expect(subject.advisories_for('does_not_exist').to_a).to be_empty
+      end
+
+      it "must count only regular advisory files" do
+        expect(subject.size).to eq(1)
+      end
+    end
+  end
+
   describe "#advisories_for" do
     let(:gem) { 'activesupport' }
     let(:vendored_advisories_for) do

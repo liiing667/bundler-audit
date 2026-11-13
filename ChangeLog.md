@@ -3,6 +3,11 @@
 * Officially support Ruby 3.4, 3.5, and 4.0.
 * Added support for Bundler 4.x.
 * Fixed typos in API documentation.
+* Hardened advisory database ingestion into a fail-closed boundary: only
+  regular, non-symlinked files inside the database root are read, advisory
+  files are size-limited and schema-validated, conflicting aliases and empty
+  version intervals are rejected, and ingestion errors abort the scan
+  instead of producing a clean result.
 
 #### CLI
 

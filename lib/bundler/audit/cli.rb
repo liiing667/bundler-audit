@@ -73,7 +73,13 @@ module Bundler
                      exit 1
                    end
 
-        report = scanner.report(ignore: options.ignore)
+        report = begin
+                   scanner.report(ignore: options.ignore)
+                 rescue Database::InvalidDatabaseError,
+                        Database::InvalidAdvisoryError => exception
+                   say_error exception.message, :red
+                   exit 1
+                 end
 
         output = if options[:output]
                    File.new(options[:output],'w')

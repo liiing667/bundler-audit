@@ -34,8 +34,23 @@ module Bundler
       class UpdateFailed < RuntimeError
       end
 
+      #
+      # Raised when the database itself violates the ingestion boundary,
+      # e.g. a path escapes the database root or two advisories declare
+      # conflicting aliases.
+      #
+      class InvalidDatabaseError < StandardError
+      end
+
+      # Raised when an advisory file cannot be ingested.
+      class InvalidAdvisoryError < StandardError
+      end
+
       # Git URL of the ruby-advisory-db.
       URL = 'https://github.com/rubysec/ruby-advisory-db.git'
+
+      # Maximum allowed size of a single advisory YAML file (1 MiB).
+      MAX_ADVISORY_SIZE = 1024 * 1024
 
       # Path to the user's copy of the ruby-advisory-db.
       USER_PATH = File.expand_path(File.join(Gem.user_home,'.local','share','ruby-advisory-db'))
@@ -64,7 +79,7 @@ module Bundler
           raise(ArgumentError,"#{path.dump} is not a directory")
         end
 
-        @path = path
+        @path = File.realpath(path)
       end
 
       #
@@ -265,8 +280,8 @@ module Bundler
       def advisories(&block)
         return enum_for(__method__) unless block_given?
 
-        each_advisory_path do |path|
-          yield Advisory.load(path)
+        each_advisory do |advisory|
+          yield advisory
         end
       end
 
@@ -288,8 +303,8 @@ module Bundler
       def advisories_for(name)
         return enum_for(__method__,name) unless block_given?
 
-        each_advisory_path_for(name) do |path|
-          yield Advisory.load(path)
+        each_advisory_for(name) do |advisory|
+          yield advisory
         end
       end
 
@@ -352,6 +367,69 @@ module Bundler
       protected
 
       #
+      # Enumerates over every valid advisory in the database, rejecting
+      # conflicting aliases.
+      #
+      # @yield [advisory]
+      #   The given block will be passed each advisory.
+      #
+      # @yieldparam [Advisory] advisory
+      #   An advisory from the database.
+      #
+      # @raise [InvalidDatabaseError]
+      #   Two advisories for the same gem declare the same identifier but
+      #   disagree about the affected versions.
+      #
+      def each_advisory(&block)
+        return enum_for(__method__) unless block_given?
+
+        each_advisory_path do |path|
+          yield load_advisory(path)
+        end
+      end
+
+      #
+      # Enumerates over every valid advisory for the given gem.
+      #
+      # @param [String] name
+      #   The gem name to lookup.
+      #
+      # @yield [advisory]
+      #   The given block will be passed each advisory for the gem.
+      #
+      # @yieldparam [Advisory] advisory
+      #   An advisory for the given gem.
+      #
+      def each_advisory_for(name,&block)
+        return enum_for(__method__,name) unless block_given?
+
+        registered_aliases = {}
+
+        each_advisory_path_for(name) do |path|
+          advisory = load_advisory(path)
+
+          advisory.qualified_identifiers.each do |identifier|
+            existing = registered_aliases[identifier]
+
+            # A shared alias is only a conflict when one of the records
+            # claims the identifier as its own primary ID (its file name)
+            # but disagrees with the other record about the version ranges.
+            if existing &&
+               (existing.id == identifier || advisory.id == identifier) &&
+               conflicting_aliases?(existing,advisory)
+              raise(InvalidDatabaseError,
+                    "conflicting advisories share identifier #{identifier.inspect}: " \
+                    "#{existing.path.dump} and #{advisory.path.dump}")
+            end
+
+            registered_aliases[identifier] ||= advisory
+          end
+
+          yield advisory
+        end
+      end
+
+      #
       # Enumerates over every advisory path in the database.
       #
       # @yield [path]
@@ -360,8 +438,20 @@ module Bundler
       # @yieldparam [String] path
       #   A path to an advisory `.yml` file.
       #
+      # @raise [InvalidDatabaseError]
+      #   A path is a symlink, is not a regular file, exceeds
+      #   {MAX_ADVISORY_SIZE}, or escapes the database root directory.
+      #
       def each_advisory_path(&block)
-        Dir.glob(File.join(@path,'gems','*','*.yml'),&block)
+        return enum_for(__method__) unless block_given?
+
+        each_gem_directory do |gem_directory|
+          Dir.children(gem_directory).sort.each do |entry|
+            next unless entry.end_with?('.yml')
+
+            yield safe_advisory_path(File.join(gem_directory,entry))
+          end
+        end
       end
 
       #
@@ -376,8 +466,122 @@ module Bundler
       # @yieldparam [String] path
       #   A path to an advisory `.yml` file.
       #
+      # @raise [InvalidDatabaseError]
+      #   The gem name is unsafe, a path is a symlink or non-regular file,
+      #   exceeds {MAX_ADVISORY_SIZE}, or escapes the database root.
+      #
       def each_advisory_path_for(name,&block)
-        Dir.glob(File.join(@path,'gems',name,'*.yml'),&block)
+        return enum_for(__method__,name) unless block_given?
+
+        # A database does not have to contain advisories for every gem.
+        return unless name.is_a?(String)
+        return if name.empty? || name =~ /\A\.\.?\z/ || name !~ /\A[A-Za-z0-9._-]+\z/
+
+        gem_directory = File.join(@path,'gems',name)
+
+        return unless File.directory?(gem_directory) && !File.symlink?(gem_directory)
+
+        ensure_within_root!(gem_directory)
+
+        Dir.children(gem_directory).sort.each do |entry|
+          next unless entry.end_with?('.yml')
+
+          yield safe_advisory_path(File.join(gem_directory,entry))
+        end
+      end
+
+      #
+      # Enumerates over the gem directories within the database.
+      #
+      def each_gem_directory
+        gems_root = File.join(@path,'gems')
+
+        return unless File.directory?(gems_root)
+
+        Dir.children(gems_root).sort.each do |entry|
+          path = File.join(gems_root,entry)
+
+          unless File.lstat(path).directory? && !File.symlink?(path)
+            raise(InvalidDatabaseError,
+                  "non-directory or symlink gem entry found in database: #{path.dump}")
+          end
+
+          ensure_within_root!(path)
+
+          yield path
+        end
+      end
+
+      #
+      # Validates that an advisory path refers to a regular, non-symlink
+      # file inside the database root and that it does not exceed
+      # {MAX_ADVISORY_SIZE}.
+      #
+      def safe_advisory_path(path)
+        stat = begin
+                 File.lstat(path)
+               rescue Errno::ENOENT
+                 raise(InvalidDatabaseError,
+                       "advisory path disappeared while reading the database: #{path.dump}")
+               end
+
+        if stat.symlink?
+          raise(InvalidDatabaseError,
+                "symlinked advisory files are not allowed: #{path.dump}")
+        end
+
+        unless stat.file?
+          raise(InvalidDatabaseError,
+                "only regular advisory files are allowed: #{path.dump}")
+        end
+
+        if stat.size > MAX_ADVISORY_SIZE
+          raise(InvalidDatabaseError,
+                "advisory file #{path.dump} is #{stat.size} bytes, " \
+                "which exceeds the limit of #{MAX_ADVISORY_SIZE} bytes")
+        end
+
+        ensure_within_root!(path)
+
+        return path
+      end
+
+      #
+      # Ensures the real path of an entry stays inside the database root,
+      # blocking hard links or bind-mount style escapes that `lstat` alone
+      # cannot detect.
+      #
+      def ensure_within_root!(path)
+        real_path = File.realpath(path)
+
+        unless real_path == @path ||
+               real_path.start_with?(@path + File::SEPARATOR)
+          raise(InvalidDatabaseError,
+                "database entry escapes the database root: #{path.dump}")
+        end
+      rescue Errno::ENOENT
+        raise(InvalidDatabaseError,
+              "database entry does not exist: #{path.dump}")
+      end
+
+      #
+      # Loads an advisory file, converting schema errors into the
+      # database-level exception so ingest failures never silently become
+      # clean scans.
+      #
+      def load_advisory(path)
+        Advisory.load(path)
+      rescue Advisory::InvalidAdvisoryError => error
+        raise(InvalidAdvisoryError,error.message)
+      end
+
+      #
+      # Determines whether two advisories sharing an identifier make
+      # incompatible claims about the affected versions.
+      #
+      def conflicting_aliases?(first,second)
+        first.patched_versions.map(&:to_s) != second.patched_versions.map(&:to_s) ||
+          first.unaffected_versions.map(&:to_s) != second.unaffected_versions.map(&:to_s)
       end
 
     end

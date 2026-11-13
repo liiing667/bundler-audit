@@ -104,7 +104,168 @@ describe Bundler::Audit::Advisory do
       it "should raise an exception" do
         expect {
           Advisory.load(path)
-        }.to raise_exception("advisory data in #{path.dump} was not a Hash")
+        }.to raise_error(
+          Advisory::InvalidAdvisoryError,
+          "advisory data in #{path.dump} was not a Hash"
+        )
+      end
+    end
+
+    context "when the YAML is malformed" do
+      let(:path) { Fixtures.join('advisory','malformed.yml') }
+
+      before do
+        File.write(path, "gem: test\npatched_versions: [\n")
+      end
+
+      after { FileUtils.rm_f(path) }
+
+      it "must raise an InvalidAdvisoryError instead of a Psych error" do
+        expect {
+          described_class.load(path)
+        }.to raise_error(Advisory::InvalidAdvisoryError, /invalid YAML/)
+      end
+    end
+
+    context "when the YAML contains aliases or custom tags" do
+      let(:path) { Fixtures.join('advisory','unsafe_alias.yml') }
+
+      after { FileUtils.rm_f(path) }
+
+      it "must reject YAML aliases" do
+        File.write(path, "gem: test\ntitle: &x 1\ndescription: *x\n")
+
+        expect {
+          described_class.load(path)
+        }.to raise_error(Advisory::InvalidAdvisoryError)
+      end
+
+      it "must reject deserialization of custom classes" do
+        File.write(path, "--- !ruby/object:Gem::Requirement {}\n")
+
+        expect {
+          described_class.load(path)
+        }.to raise_error(Advisory::InvalidAdvisoryError)
+      end
+    end
+
+    context "when the schema is violated" do
+      let(:path) { Fixtures.join('advisory','invalid_schema.yml') }
+
+      after { FileUtils.rm_f(path) }
+
+      it "must reject unsupported keys" do
+        File.write(path, "gem: test\nsurprise_key: true\n")
+
+        expect {
+          described_class.load(path)
+        }.to raise_error(Advisory::InvalidAdvisoryError, /unsupported key/)
+      end
+
+      it "must reject a missing gem value" do
+        File.write(path, "title: no gem here\n")
+
+        expect {
+          described_class.load(path)
+        }.to raise_error(Advisory::InvalidAdvisoryError, /'gem'/)
+      end
+
+      it "must reject non-string scalar values" do
+        File.write(path, "gem: 1234\n")
+
+        expect {
+          described_class.load(path)
+        }.to raise_error(Advisory::InvalidAdvisoryError, /'gem'/)
+      end
+
+      it "must reject malformed identifiers" do
+        File.write(path, "gem: test\ncve: not-a-cve\n")
+
+        expect {
+          described_class.load(path)
+        }.to raise_error(Advisory::InvalidAdvisoryError, /'cve'/)
+      end
+
+      it "must reject CVSS scores outside of 0.0..10.0" do
+        File.write(path, "gem: test\ncvss_v3: 11.0\n")
+
+        expect {
+          described_class.load(path)
+        }.to raise_error(Advisory::InvalidAdvisoryError, /cvss_v3/)
+      end
+
+      it "must reject version lists containing non-strings" do
+        File.write(path, "gem: test\npatched_versions:\n  - 1\n")
+
+        expect {
+          described_class.load(path)
+        }.to raise_error(Advisory::InvalidAdvisoryError, /patched_versions/)
+      end
+
+      it "must reject version lists containing empty strings" do
+        File.write(path, "gem: test\npatched_versions:\n  - \"\"\n")
+
+        expect {
+          described_class.load(path)
+        }.to raise_error(Advisory::InvalidAdvisoryError, /patched_versions/)
+      end
+    end
+
+    context "when a version requirement is malformed" do
+      let(:path) { Fixtures.join('advisory','bad_requirement.yml') }
+
+      after { FileUtils.rm_f(path) }
+
+      it "must raise an InvalidAdvisoryError instead of a BadRequirementError" do
+        File.write(path, "gem: test\npatched_versions:\n  - \"garbage\"\n")
+
+        expect {
+          described_class.load(path)
+        }.to raise_error(Advisory::InvalidAdvisoryError, /invalid version requirement/)
+      end
+    end
+
+    context "when a version interval can never be satisfied" do
+      let(:path) { Fixtures.join('advisory','empty_interval.yml') }
+
+      after { FileUtils.rm_f(path) }
+
+      it "must reject contradictory lower and upper bounds" do
+        File.write(path, "gem: test\npatched_versions:\n  - \">= 2.0, < 1.0\"\n")
+
+        expect {
+          described_class.load(path)
+        }.to raise_error(Advisory::InvalidAdvisoryError, /empty version interval/)
+      end
+
+      it "must reject contradictory exact versions" do
+        File.write(path, "gem: test\npatched_versions:\n  - \"= 1.0, = 2.0\"\n")
+
+        expect {
+          described_class.load(path)
+        }.to raise_error(Advisory::InvalidAdvisoryError, /empty version interval/)
+      end
+
+      it "must reject an open-ended exclusive bound at the same version" do
+        File.write(path, "gem: test\nunaffected_versions:\n  - \"> 1.0, <= 1.0\"\n")
+
+        expect {
+          described_class.load(path)
+        }.to raise_error(Advisory::InvalidAdvisoryError, /empty version interval/)
+      end
+
+      it "must reject an exact version excluded by another constraint" do
+        File.write(path, "gem: test\npatched_versions:\n  - \"= 1.0, != 1.0\"\n")
+
+        expect {
+          described_class.load(path)
+        }.to raise_error(Advisory::InvalidAdvisoryError, /empty version interval/)
+      end
+
+      it "must still accept a valid bounded interval" do
+        File.write(path, "gem: test\npatched_versions:\n  - \">= 1.0, < 2.0\"\n")
+
+        expect(described_class.load(path).patched_versions).not_to be_empty
       end
     end
 
